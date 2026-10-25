@@ -59,17 +59,28 @@ Windows:
 - CMake 3.25+
 - Ninja
 - Clang / LLVM
-- ReXGlue SDK checked out separately
+- ReXGlue SDK (included as the `rexglue-sdk` submodule)
 - `rexglue` available on `PATH`
 
 Linux:
 - CMake 3.25+
 - Ninja
 - Clang 20 / `clang++-20`
-- ReXGlue SDK checked out separately
+- ReXGlue SDK (included as the `rexglue-sdk` submodule)
 - `rexglue` available on `PATH`
 
-Both projects also expect the SDK to be available via `REXSDK_DIR` or the existing local CMake setup.
+The SDK lives in the `rexglue-sdk` submodule, pinned to
+https://github.com/LucioXerus/rexglue-sdk. Clone with submodules (or fetch them
+afterwards) so it is present:
+
+```
+git clone --recurse-submodules https://github.com/LucioXerus/bo2-recompiled.git
+# already cloned:
+git submodule update --init --recursive
+```
+
+The SDK's own third-party dependencies are submodules too, so use `--recursive`.
+Once built, point CMake at it with `REXSDK_DIR` (see `scripts/*/preset.sh|bat`).
 
 ## Setup Flow
 
