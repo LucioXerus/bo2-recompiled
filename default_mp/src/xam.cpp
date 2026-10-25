@@ -7,6 +7,7 @@
 #include <rex/runtime.h>
 #include <rex/kernel/xboxkrnl/error.h>
 #include <rex/ppc/function.h>
+#include <rex/hook.h>
 #include <rex/string.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/kernel_state.h>
@@ -28,7 +29,7 @@ void InstallXamOverrides(rex::Runtime* runtime);
 
 }  // namespace default_mp
 
-namespace {
+namespace default_mp::detail {
 
 using namespace rex;
 using namespace rex::system;
@@ -162,10 +163,26 @@ bool HandleXgiMessage(uint32_t message, uint32_t buffer_ptr, uint32_t buffer_len
   }
 }
 
-bool HandleXLiveBaseMessage(uint32_t message, X_HRESULT& out_result) {
+bool HandleXLiveBaseMessage(uint32_t message, uint32_t buffer_ptr, uint32_t buffer_length,
+                            X_HRESULT& out_result) {
   if (message != kMsgXLiveGetServiceInfo) {
     return false;
   }
+
+  // XOnlineGetServiceInfo(service_id, pServiceInfo). The SDK returns
+  // ERROR_CONNECTION_INVALID unconditionally, which makes titles report
+  // "no network connection" even in local/system-link modes. Report the
+  // service as available and fill the buffer with a zeroed, valid record.
+  auto* memory = REX_KERNEL_MEMORY();
+  if (buffer_ptr && buffer_length > 0) {
+    auto* buffer = memory->TranslateVirtual(buffer_ptr);
+    std::memset(buffer, 0, buffer_length);
+    // Service is "available": status at the head of the record.
+    if (buffer_length >= 4) {
+      memory::store_and_swap<uint32_t>(buffer, 1);
+    }
+  }
+
   out_result = X_E_SUCCESS;
   return true;
 }
@@ -176,7 +193,7 @@ X_HRESULT DispatchWithOverrides(uint32_t app, uint32_t message, uint32_t buffer_
   if (app == kAppXgi && HandleXgiMessage(message, buffer_ptr, buffer_length, result)) {
     return result;
   }
-  if (app == kAppXLiveBase && HandleXLiveBaseMessage(message, result)) {
+  if (app == kAppXLiveBase && HandleXLiveBaseMessage(message, buffer_ptr, buffer_length, result)) {
     return result;
   }
   return DispatchSync(app, message, buffer_ptr, buffer_length);
@@ -189,13 +206,12 @@ X_HRESULT StartIoRequestWithOverrides(uint32_t app, uint32_t message, uint32_t o
   if (app == kAppXgi) {
     handled = HandleXgiMessage(message, buffer_ptr, buffer_length, result);
   } else if (app == kAppXLiveBase) {
-    handled = HandleXLiveBaseMessage(message, result);
+    handled = HandleXLiveBaseMessage(message, buffer_ptr, buffer_length, result);
   }
 
   if (!handled) {
     result = DispatchAsync(app, message, buffer_ptr, buffer_length);
     if (result == X_E_NOTFOUND) {
-      result = X_E_INVALIDARG;
       XThread::SetLastError(X_ERROR_NOT_FOUND);
     }
   }
@@ -211,16 +227,15 @@ X_HRESULT StartIoRequestWithOverrides(uint32_t app, uint32_t message, uint32_t o
   return result;
 }
 
-ppc_u32_result_t XamUserCheckPrivilegeOverride(ppc_u32_t user_index, ppc_u32_t mask,
-                                               ppc_pu32_t out_value) {
+u32 XamUserCheckPrivilegeOverride(u32 user_index, u32 mask, mapped_u32 out_value) {
   (void)mask;
-  if (user_index != 0xFF) {
-    if (user_index >= 4) {
-      return X_ERROR_INVALID_PARAMETER;
-    }
-    if (user_index) {
-      return X_ERROR_NO_SUCH_USER;
-    }
+  // 0xFF is the "any signed-in user" sentinel, so accept it alongside the four
+  // real local slots. Every slot 0..3 must report the privilege as granted:
+  // the game checks each splitscreen player's privileges before it will let
+  // that controller join, so rejecting 1..3 with X_ERROR_NO_SUCH_USER silently
+  // blocks players 2-4 even though their input is arriving fine.
+  if (user_index != 0xFF && user_index >= 4) {
+    return X_ERROR_INVALID_PARAMETER;
   }
 
   if (out_value) {
@@ -229,29 +244,25 @@ ppc_u32_result_t XamUserCheckPrivilegeOverride(ppc_u32_t user_index, ppc_u32_t m
   return X_ERROR_SUCCESS;
 }
 
-ppc_u32_result_t XMsgInProcessCallOverride(ppc_u32_t app, ppc_u32_t message, ppc_u32_t arg1,
-                                           ppc_u32_t arg2) {
+u32 XMsgInProcessCallOverride(u32 app, u32 message, u32 arg1, u32 arg2) {
   return DispatchWithOverrides(app, message, arg1, arg2);
 }
 
-ppc_u32_result_t XMsgStartIORequestExOverride(ppc_u32_t app, ppc_u32_t message,
-                                              ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr,
-                                              ppc_u32_t buffer_ptr, ppc_u32_t buffer_length,
-                                              ppc_ptr_t<XMSGSTARTIOREQUEST_UNKNOWNARG> unknown_ptr) {
+u32 XMsgStartIORequestExOverride(u32 app, u32 message, ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr,
+                                 u32 buffer_ptr, u32 buffer_length,
+                                 ppc_ptr_t<XMSGSTARTIOREQUEST_UNKNOWNARG> unknown_ptr) {
   (void)unknown_ptr;
   return StartIoRequestWithOverrides(app, message, overlapped_ptr.guest_address(), buffer_ptr,
                                      buffer_length);
 }
 
-ppc_u32_result_t XMsgStartIORequestOverride(ppc_u32_t app, ppc_u32_t message,
-                                            ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr,
-                                            ppc_u32_t buffer_ptr, ppc_u32_t buffer_length) {
+u32 XMsgStartIORequestOverride(u32 app, u32 message, ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr,
+                               u32 buffer_ptr, u32 buffer_length) {
   return StartIoRequestWithOverrides(app, message, overlapped_ptr.guest_address(), buffer_ptr,
                                      buffer_length);
 }
 
-ppc_u32_result_t XMsgCancelIORequestOverride(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr,
-                                             ppc_u32_t wait) {
+u32 XMsgCancelIORequestOverride(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr, u32 wait) {
   X_HANDLE event_handle = XOverlappedGetEvent(overlapped_ptr);
   if (event_handle && wait) {
     auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
@@ -262,16 +273,15 @@ ppc_u32_result_t XMsgCancelIORequestOverride(ppc_ptr_t<XAM_OVERLAPPED> overlappe
   return 0;
 }
 
-ppc_u32_result_t XMsgCompleteIORequestOverride(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr,
-                                               ppc_u32_t result, ppc_u32_t extended_error,
-                                               ppc_u32_t length) {
+u32 XMsgCompleteIORequestOverride(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr, u32 result,
+                                  u32 extended_error, u32 length) {
   REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(overlapped_ptr.guest_address(), result,
                                                     extended_error, length);
   return X_ERROR_SUCCESS;
 }
 
-ppc_u32_result_t XamGetOverlappedResultOverride(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr,
-                                                ppc_pu32_t length_ptr, ppc_u32_t unknown) {
+u32 XamGetOverlappedResultOverride(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr, mapped_u32 length_ptr,
+                                   u32 unknown) {
   (void)unknown;
   uint32_t result = 0;
   if (overlapped_ptr->result != X_ERROR_IO_PENDING) {
@@ -293,7 +303,7 @@ ppc_u32_result_t XamGetOverlappedResultOverride(ppc_ptr_t<XAM_OVERLAPPED> overla
   return result;
 }
 
-ppc_u32_result_t NetDllXNetGetTitleXnAddrOverride(ppc_u32_t caller, ppc_ptr_t<XNADDR> addr_ptr) {
+u32 NetDllXNetGetTitleXnAddrOverride(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
   (void)caller;
   addr_ptr->ina = 0xC0A80164;
   addr_ptr->ina_online = 0;
@@ -303,8 +313,8 @@ ppc_u32_result_t NetDllXNetGetTitleXnAddrOverride(ppc_u32_t caller, ppc_ptr_t<XN
   return kXNetGetXnAddrEthernet | kXNetGetXnAddrStatic;
 }
 
-ppc_u32_result_t NetDllXNetXnAddrToMachineIdOverride(ppc_u32_t caller, ppc_ptr_t<XNADDR> addr_ptr,
-                                                     ppc_pu32_t id_ptr) {
+u32 NetDllXNetXnAddrToMachineIdOverride(u32 caller, ppc_ptr_t<XNADDR> addr_ptr,
+                                        mapped_u32 id_ptr) {
   (void)caller;
   (void)addr_ptr;
   if (id_ptr) {
@@ -313,15 +323,17 @@ ppc_u32_result_t NetDllXNetXnAddrToMachineIdOverride(ppc_u32_t caller, ppc_ptr_t
   return 0;
 }
 
-void NetDllXNetInAddrToStringOverride(ppc_u32_t caller, ppc_u32_t in_addr_val,
-                                      ppc_pchar_t string_out, ppc_u32_t string_size) {
+void NetDllXNetInAddrToStringOverride(u32 caller, u32 in_addr_val, mapped_string string_out,
+                                      u32 string_size) {
   (void)caller;
   (void)in_addr_val;
-  rex::string::rex_strcpy(string_out, string_size, "127.0.0.1");
+  if (string_out) {
+    rex::string::copy_truncating(string_out.host_address(), "127.0.0.1", string_size);
+  }
 }
 
-ppc_u32_result_t NetDllXNetXnAddrToInAddrOverride(ppc_u32_t caller, ppc_ptr_t<XNADDR> xn_addr,
-                                                  ppc_pvoid_t xid, ppc_pvoid_t in_addr) {
+u32 NetDllXNetXnAddrToInAddrOverride(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
+                                     mapped_void in_addr) {
   (void)caller;
   (void)xid;
   if (in_addr && xn_addr) {
@@ -331,8 +343,8 @@ ppc_u32_result_t NetDllXNetXnAddrToInAddrOverride(ppc_u32_t caller, ppc_ptr_t<XN
   return 0;
 }
 
-ppc_u32_result_t NetDllXNetInAddrToXnAddrOverride(ppc_u32_t caller, ppc_pvoid_t in_addr,
-                                                  ppc_ptr_t<XNADDR> xn_addr, ppc_pvoid_t xid) {
+u32 NetDllXNetInAddrToXnAddrOverride(u32 caller, mapped_void in_addr, ppc_ptr_t<XNADDR> xn_addr,
+                                     mapped_void xid) {
   (void)caller;
   (void)xid;
   if (xn_addr && in_addr) {
@@ -346,8 +358,8 @@ ppc_u32_result_t NetDllXNetInAddrToXnAddrOverride(ppc_u32_t caller, ppc_pvoid_t 
   return 0;
 }
 
-ppc_u32_result_t NetDllXNetQosServiceLookupOverride(ppc_u32_t caller, ppc_u32_t flags,
-                                                    ppc_u32_t event_handle, ppc_pu32_t pqos) {
+u32 NetDllXNetQosServiceLookupOverride(u32 caller, u32 flags, u32 event_handle,
+                                       mapped_u32 pqos) {
   (void)caller;
   (void)flags;
   if (pqos) {
@@ -367,8 +379,8 @@ ppc_u32_result_t NetDllXNetQosServiceLookupOverride(ppc_u32_t caller, ppc_u32_t 
   return 0;
 }
 
-ppc_u32_result_t NetDllXNetQosListenOverride(ppc_u32_t caller, ppc_pvoid_t id, ppc_pvoid_t data,
-                                             ppc_u32_t data_size, ppc_u32_t r7, ppc_u32_t flags) {
+u32 NetDllXNetQosListenOverride(u32 caller, mapped_void id, mapped_void data, u32 data_size,
+                                u32 r7, u32 flags) {
   (void)caller;
   (void)id;
   (void)data;
@@ -378,15 +390,13 @@ ppc_u32_result_t NetDllXNetQosListenOverride(ppc_u32_t caller, ppc_pvoid_t id, p
   return 0;
 }
 
-ppc_u32_result_t NetDllXNetGetEthernetLinkStatusOverride(ppc_u32_t caller) {
+u32 NetDllXNetGetEthernetLinkStatusOverride(u32 caller) {
   (void)caller;
   return kXNetEthernetLinkActive | kXNetEthernetLink100Mbps | kXNetEthernetLinkFullDuplex;
 }
 
-ppc_u32_result_t NetDllRecvFromOverride(ppc_u32_t caller, ppc_u32_t socket_handle,
-                                        ppc_pvoid_t buf_ptr, ppc_u32_t buf_len, ppc_u32_t flags,
-                                        ppc_ptr_t<XSOCKADDR_IN> from_ptr,
-                                        ppc_pu32_t fromlen_ptr) {
+u32 NetDllRecvFromOverride(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
+                           u32 flags, ppc_ptr_t<XSOCKADDR_IN> from_ptr, mapped_u32 fromlen_ptr) {
   (void)caller;
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
@@ -412,12 +422,9 @@ ppc_u32_result_t NetDllRecvFromOverride(ppc_u32_t caller, ppc_u32_t socket_handl
   }
 
   if (ret == -1) {
-#if REX_PLATFORM_WIN32
-    uint32_t error_code = WSAGetLastError();
-    XThread::SetLastError(error_code ? error_code : kWsaeWouldBlock);
-#else
+    // The socket object has already recorded the cause; surface it as a would
+    // block so callers retry (WSA errors are not available here).
     XThread::SetLastError(kWsaeWouldBlock);
-#endif
     return static_cast<uint32_t>(-1);
   }
 
@@ -425,9 +432,8 @@ ppc_u32_result_t NetDllRecvFromOverride(ppc_u32_t caller, ppc_u32_t socket_handl
   return static_cast<uint32_t>(ret);
 }
 
-ppc_u32_result_t NetDllSendToOverride(ppc_u32_t caller, ppc_u32_t socket_handle,
-                                      ppc_pvoid_t buf_ptr, ppc_u32_t buf_len, ppc_u32_t flags,
-                                      ppc_ptr_t<XSOCKADDR_IN> to_ptr, ppc_u32_t to_len) {
+u32 NetDllSendToOverride(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
+                         u32 flags, ppc_ptr_t<XSOCKADDR_IN> to_ptr, u32 to_len) {
   (void)caller;
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
@@ -438,11 +444,7 @@ ppc_u32_result_t NetDllSendToOverride(ppc_u32_t caller, ppc_u32_t socket_handle,
   N_XSOCKADDR_IN native_to(to_ptr);
   int ret = socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
   if (ret == -1) {
-#if REX_PLATFORM_WIN32
-    XThread::SetLastError(WSAGetLastError());
-#else
-    XThread::SetLastError(0);
-#endif
+    XThread::SetLastError(kWsaeWouldBlock);
     return static_cast<uint32_t>(-1);
   }
 
@@ -450,95 +452,42 @@ ppc_u32_result_t NetDllSendToOverride(ppc_u32_t caller, ppc_u32_t socket_handle,
   return static_cast<uint32_t>(ret);
 }
 
-void InstallHostDetour(const char* name, PPCFunc* replacement) {
-#if REX_PLATFORM_WIN32
-  auto* target = rex::FindPPCFuncByName(name);
-  assert_not_null(target);
+}  // namespace default_mp::detail
 
-  constexpr size_t kPatchSize = 12;
-  DWORD old_protect = 0;
-  auto* patch = reinterpret_cast<uint8_t*>(reinterpret_cast<void*>(target));
-  BOOL protect_ok =
-      VirtualProtect(patch, kPatchSize, PAGE_EXECUTE_READWRITE, &old_protect);
-  assert_true(protect_ok);
+// These hooks replace the SDK's default XAM/net exports with offline-friendly
+// behaviour. They must live in the default_mp translation unit that declares
+// the generated imports; the kernel exports are registered by name, so a hook
+// defined here takes precedence over the SDK's weak implementations.
+// A guest export override needs both halves:
+//  - REX_HOOK: patches direct `__imp__` calls resolved at link time.
+//  - REX_EXPORT: registers in the PPCFuncRegistrar so XexGetProcedureAddress
+//    (which the game uses for several Xam calls) resolves to our version.
+#define DEFAULT_MP_HOOK(symbol, fn)              \
+  REX_EXTERN(__imp__##symbol);                   \
+  REX_EXPORT(__imp__##symbol, default_mp::detail::fn)
 
-  patch[0] = 0x48;
-  patch[1] = 0xB8;
-  *reinterpret_cast<uint64_t*>(patch + 2) = reinterpret_cast<uint64_t>(replacement);
-  patch[10] = 0xFF;
-  patch[11] = 0xE0;
+// XAM message apps (XGI / XLiveBase).
+DEFAULT_MP_HOOK(XMsgInProcessCall, XMsgInProcessCallOverride)
+DEFAULT_MP_HOOK(XMsgStartIORequest, XMsgStartIORequestOverride)
+DEFAULT_MP_HOOK(XMsgStartIORequestEx, XMsgStartIORequestExOverride)
+DEFAULT_MP_HOOK(XMsgCancelIORequest, XMsgCancelIORequestOverride)
+DEFAULT_MP_HOOK(XMsgCompleteIORequest, XMsgCompleteIORequestOverride)
+DEFAULT_MP_HOOK(XamGetOverlappedResult, XamGetOverlappedResultOverride)
+DEFAULT_MP_HOOK(XamUserCheckPrivilege, XamUserCheckPrivilegeOverride)
 
-  FlushInstructionCache(GetCurrentProcess(), patch, kPatchSize);
+// System-link / LAN network state.
+DEFAULT_MP_HOOK(NetDll_XNetGetTitleXnAddr, NetDllXNetGetTitleXnAddrOverride)
+DEFAULT_MP_HOOK(NetDll_XNetXnAddrToMachineId, NetDllXNetXnAddrToMachineIdOverride)
+DEFAULT_MP_HOOK(NetDll_XNetInAddrToString, NetDllXNetInAddrToStringOverride)
+DEFAULT_MP_HOOK(NetDll_XNetXnAddrToInAddr, NetDllXNetXnAddrToInAddrOverride)
+DEFAULT_MP_HOOK(NetDll_XNetInAddrToXnAddr, NetDllXNetInAddrToXnAddrOverride)
+DEFAULT_MP_HOOK(NetDll_XNetQosServiceLookup, NetDllXNetQosServiceLookupOverride)
+DEFAULT_MP_HOOK(NetDll_XNetQosListen, NetDllXNetQosListenOverride)
+DEFAULT_MP_HOOK(NetDll_XNetGetEthernetLinkStatus, NetDllXNetGetEthernetLinkStatusOverride)
 
-  DWORD unused_protect = 0;
-  VirtualProtect(patch, kPatchSize, old_protect, &unused_protect);
-#else
-  (void)name;
-  (void)replacement;
-  assert_always();
-#endif
-}
+#undef DEFAULT_MP_HOOK
 
-PPC_HOOK(default_mp__XamUserCheckPrivilege, XamUserCheckPrivilegeOverride)
-PPC_HOOK(default_mp__XMsgInProcessCall, XMsgInProcessCallOverride)
-PPC_HOOK(default_mp__XMsgStartIORequestEx, XMsgStartIORequestExOverride)
-PPC_HOOK(default_mp__XMsgStartIORequest, XMsgStartIORequestOverride)
-PPC_HOOK(default_mp__XMsgCancelIORequest, XMsgCancelIORequestOverride)
-PPC_HOOK(default_mp__XMsgCompleteIORequest, XMsgCompleteIORequestOverride)
-PPC_HOOK(default_mp__XamGetOverlappedResult, XamGetOverlappedResultOverride)
-PPC_HOOK(default_mp__NetDllXNetGetTitleXnAddr, NetDllXNetGetTitleXnAddrOverride)
-PPC_HOOK(default_mp__NetDllXNetXnAddrToMachineId, NetDllXNetXnAddrToMachineIdOverride)
-PPC_HOOK(default_mp__NetDllXNetInAddrToString, NetDllXNetInAddrToStringOverride)
-PPC_HOOK(default_mp__NetDllXNetXnAddrToInAddr, NetDllXNetXnAddrToInAddrOverride)
-PPC_HOOK(default_mp__NetDllXNetInAddrToXnAddr, NetDllXNetInAddrToXnAddrOverride)
-PPC_HOOK(default_mp__NetDllXNetQosServiceLookup, NetDllXNetQosServiceLookupOverride)
-PPC_HOOK(default_mp__NetDllXNetQosListen, NetDllXNetQosListenOverride)
-PPC_HOOK(default_mp__NetDllXNetGetEthernetLinkStatus, NetDllXNetGetEthernetLinkStatusOverride)
-PPC_HOOK(default_mp__NetDllRecvFrom, NetDllRecvFromOverride)
-PPC_HOOK(default_mp__NetDllSendTo, NetDllSendToOverride)
+// Keep this at the end of the file so it is never the active translation unit
+// for the generated imports above.
+void default_mp::InstallXamOverrides(rex::Runtime* runtime) { (void)runtime; }
 
-}  // namespace
-
-void default_mp::InstallXamOverrides(rex::Runtime* runtime) {
-  auto* dispatcher = runtime->function_dispatcher();
-  dispatcher->SetFunction(kImpXamUserCheckPrivilege, &default_mp__XamUserCheckPrivilege);
-  dispatcher->SetFunction(kImpXMsgInProcessCall, &default_mp__XMsgInProcessCall);
-  dispatcher->SetFunction(kImpXMsgStartIORequestEx, &default_mp__XMsgStartIORequestEx);
-  dispatcher->SetFunction(kImpXMsgStartIORequest, &default_mp__XMsgStartIORequest);
-  dispatcher->SetFunction(kImpXMsgCancelIORequest, &default_mp__XMsgCancelIORequest);
-  dispatcher->SetFunction(kImpXMsgCompleteIORequest, &default_mp__XMsgCompleteIORequest);
-  dispatcher->SetFunction(kImpXamGetOverlappedResult, &default_mp__XamGetOverlappedResult);
-
-  dispatcher->SetFunction(kImpXNetGetTitleXnAddr, &default_mp__NetDllXNetGetTitleXnAddr);
-  dispatcher->SetFunction(kImpXNetXnAddrToMachineId, &default_mp__NetDllXNetXnAddrToMachineId);
-  dispatcher->SetFunction(kImpXNetInAddrToString, &default_mp__NetDllXNetInAddrToString);
-  dispatcher->SetFunction(kImpXNetXnAddrToInAddr, &default_mp__NetDllXNetXnAddrToInAddr);
-  dispatcher->SetFunction(kImpXNetInAddrToXnAddr, &default_mp__NetDllXNetInAddrToXnAddr);
-  dispatcher->SetFunction(kImpXNetQosServiceLookup, &default_mp__NetDllXNetQosServiceLookup);
-  dispatcher->SetFunction(kImpXNetQosListen, &default_mp__NetDllXNetQosListen);
-  dispatcher->SetFunction(kImpXNetGetEthernetLinkStatus, &default_mp__NetDllXNetGetEthernetLinkStatus);
-  dispatcher->SetFunction(kImpNetRecvFrom, &default_mp__NetDllRecvFrom);
-  dispatcher->SetFunction(kImpNetSendTo, &default_mp__NetDllSendTo);
-
-  InstallHostDetour("__imp__XamUserCheckPrivilege", &default_mp__XamUserCheckPrivilege);
-  InstallHostDetour("__imp__XMsgInProcessCall", &default_mp__XMsgInProcessCall);
-  InstallHostDetour("__imp__XMsgStartIORequestEx", &default_mp__XMsgStartIORequestEx);
-  InstallHostDetour("__imp__XMsgStartIORequest", &default_mp__XMsgStartIORequest);
-  InstallHostDetour("__imp__XMsgCancelIORequest", &default_mp__XMsgCancelIORequest);
-  InstallHostDetour("__imp__XMsgCompleteIORequest", &default_mp__XMsgCompleteIORequest);
-  InstallHostDetour("__imp__XamGetOverlappedResult", &default_mp__XamGetOverlappedResult);
-
-  InstallHostDetour("__imp__NetDll_XNetGetTitleXnAddr", &default_mp__NetDllXNetGetTitleXnAddr);
-  InstallHostDetour("__imp__NetDll_XNetXnAddrToMachineId",
-                    &default_mp__NetDllXNetXnAddrToMachineId);
-  InstallHostDetour("__imp__NetDll_XNetInAddrToString", &default_mp__NetDllXNetInAddrToString);
-  InstallHostDetour("__imp__NetDll_XNetXnAddrToInAddr", &default_mp__NetDllXNetXnAddrToInAddr);
-  InstallHostDetour("__imp__NetDll_XNetInAddrToXnAddr", &default_mp__NetDllXNetInAddrToXnAddr);
-  InstallHostDetour("__imp__NetDll_XNetQosServiceLookup",
-                    &default_mp__NetDllXNetQosServiceLookup);
-  InstallHostDetour("__imp__NetDll_XNetQosListen", &default_mp__NetDllXNetQosListen);
-  InstallHostDetour("__imp__NetDll_XNetGetEthernetLinkStatus",
-                    &default_mp__NetDllXNetGetEthernetLinkStatus);
-  InstallHostDetour("__imp__NetDll_recvfrom", &default_mp__NetDllRecvFrom);
-  InstallHostDetour("__imp__NetDll_sendto", &default_mp__NetDllSendTo);
-}

@@ -11,10 +11,6 @@
 
 REXCVAR_DECLARE(std::string, mode);
 
-namespace default_mp {
-void InstallXamOverrides(rex::Runtime* runtime);
-}
-
 class DefaultMpApp : public rex::ReXApp {
  public:
   using rex::ReXApp::ReXApp;
@@ -29,15 +25,11 @@ class DefaultMpApp : public rex::ReXApp {
   }
 
   void OnLoadXexImage(std::string& xex_image) override {
-    xex_image = "game:/default_mp.xex";
+    xex_image = "game:\\default_mp.xex";
   }
 
   void OnConfigurePaths(rex::PathConfig& paths) override {
     paths.update_data_root = paths.game_data_root;
-  }
-
-  void OnPostSetup() override {
-    default_mp::InstallXamOverrides(runtime());
   }
 
   void OnPreLaunchModule() override {

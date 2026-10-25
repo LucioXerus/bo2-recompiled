@@ -13,3 +13,6 @@ assets/*
 !*/generated/.gitkeep
 !*/out/.gitkeep
 !*/assets/.gitkeep
+
+# Local game data (7+ GB of retail game files, keep it out of the repo).
+/Call of Duty Black Ops 2/

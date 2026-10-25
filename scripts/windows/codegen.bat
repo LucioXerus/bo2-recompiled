@@ -12,12 +12,12 @@ if errorlevel 1 exit /b 1
 if "%TARGET_DEFAULT%"=="0" if "%TARGET_MP%"=="0" set "TARGET_DEFAULT=1"
 
 if "%TARGET_DEFAULT%"=="1" (
-    call :run_codegen default default_config.toml
+    call :run_codegen default default_manifest.toml
     if errorlevel 1 exit /b 1
 )
 
 if "%TARGET_MP%"=="1" (
-    call :run_codegen default_mp default_mp_config.toml
+    call :run_codegen default_mp default_mp_manifest.toml
     if errorlevel 1 exit /b 1
 )
 
@@ -60,6 +60,14 @@ rexglue codegen "%CONFIG_FILE%"
 if errorlevel 1 (
     echo ERROR: Codegen failed for %PROJECT%
     exit /b 1
+)
+
+if /I "%PROJECT%"=="default_mp" (
+    python "%~dp0..\patch_generated.py"
+    if errorlevel 1 (
+        echo ERROR: Post-codegen patch failed for %PROJECT%
+        exit /b 1
+    )
 )
 
 exit /b 0

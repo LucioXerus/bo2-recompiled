@@ -44,11 +44,12 @@ if [[ "${TARGET_DEFAULT}" == "0" && "${TARGET_MP}" == "0" ]]; then
 fi
 
 if [[ "${TARGET_DEFAULT}" == "1" ]]; then
-  run_codegen default default_config.toml
+  run_codegen default default_manifest.toml
 fi
 
 if [[ "${TARGET_MP}" == "1" ]]; then
-  run_codegen default_mp default_mp_config.toml
+  run_codegen default_mp default_mp_manifest.toml
+  python3 "${SCRIPT_DIR}/../patch_generated.py"
 fi
 
 echo "Done."

@@ -25,4 +25,4 @@ else()
     add_executable(default_mp ${DEFAULTMP_SOURCES})
 endif()
 
-rexglue_setup_target(default_mp)
+rexglue_setup_target(default_mp GPU_PLUGINS xenos)

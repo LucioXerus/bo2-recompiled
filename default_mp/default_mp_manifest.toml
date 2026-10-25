@@ -1,0 +1,29 @@
+# default_mp - ReXGlue Codegen Manifest
+# Converted from default_mp_config.toml for the manifest-based layout.
+
+# default_mp.xex
+
+[project]
+name = "default_mp"
+sdk_version = "0.10.0"
+
+[entrypoint]
+file_path = "../assets/default_mp.xex"
+out_directory_path = "generated"
+includes = []
+
+setjmp_address  = 0x827D8600
+longjmp_address = 0x827D9790
+
+[entrypoint.functions]
+# target not in any function
+0x82425F18={name = "sub_0x82425F18", end = 0x82425F20}
+
+# Unhandled exception at 0x0000000000000000
+0x826c4428={}
+0x826bf2f0={}
+0x826c5818={}
+0x826cacb8={}
+0x8221af28={}
+# same exception, but inside actual MP menu
+0x821c47c8={}
